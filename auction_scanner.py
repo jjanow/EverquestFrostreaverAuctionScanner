@@ -6,9 +6,11 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,6 +36,9 @@ APP_DIR = Path.home() / ".eq_auction_scanner"
 WATCHLIST_PATH = APP_DIR / "watchlist.txt"
 CATALOG_CACHE_PATH = APP_DIR / "catalog_frostreaver.json"
 REQUEST_TIMEOUT_SECONDS = 30
+API_MIN_REQUEST_INTERVAL_SECONDS = 0.75
+API_MAX_RETRIES = 3
+API_BACKOFF_SECONDS = 2
 MAX_BULK_ITEMS = 200
 RECENT_SALES_PER_ITEM = 20
 
@@ -57,8 +62,11 @@ class ResultRow:
     item_name: str
     seller: str
     price: str
+    plat_price: float
+    krono_price: float
     age: str
     sold_at: str
+    sold_at_datetime: datetime
     inquiry: str
 
 
@@ -69,6 +77,8 @@ class ApiError(RuntimeError):
 class TlpAuctionsClient:
     def __init__(self, base_url: str = API_BASE_URL) -> None:
         self.base_url = base_url.rstrip("/")
+        self._last_request_at = 0.0
+        self._request_lock = threading.Lock()
 
     def get_catalog(self, server_name: str) -> list[CatalogItem]:
         query = urllib.parse.urlencode({"serverName": server_name})
@@ -115,17 +125,33 @@ class TlpAuctionsClient:
             headers["Content-Type"] = "application/json"
             method = "POST"
 
-        request = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise ApiError(f"API request failed with HTTP {exc.code}: {detail}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            raise ApiError(f"API request failed: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise ApiError("API returned invalid JSON") from exc
+        for attempt in range(API_MAX_RETRIES + 1):
+            request = urllib.request.Request(url, data=data, headers=headers, method=method)
+            self._wait_for_rate_limit()
+            try:
+                with urllib.request.urlopen(
+                    request, timeout=REQUEST_TIMEOUT_SECONDS
+                ) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 429 and attempt < API_MAX_RETRIES:
+                    time.sleep(retry_delay(exc, attempt))
+                    continue
+                raise ApiError(f"API request failed with HTTP {exc.code}: {detail}") from exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                raise ApiError(f"API request failed: {exc}") from exc
+            except json.JSONDecodeError as exc:
+                raise ApiError("API returned invalid JSON") from exc
+        raise ApiError("API request failed after retrying rate-limited responses.")
+
+    def _wait_for_rate_limit(self) -> None:
+        with self._request_lock:
+            elapsed = time.monotonic() - self._last_request_at
+            wait_seconds = API_MIN_REQUEST_INTERVAL_SECONDS - elapsed
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            self._last_request_at = time.monotonic()
 
 
 class ItemResolver:
@@ -169,7 +195,10 @@ class AuctionScannerApp(tk.Tk):
 
         self.client = TlpAuctionsClient()
         self.catalog: list[CatalogItem] = []
+        self.result_rows: list[ResultRow] = []
         self.row_data: dict[str, ResultRow] = {}
+        self.sort_column = "sold_at"
+        self.sort_descending = True
         self.worker_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.is_busy = False
 
@@ -227,15 +256,29 @@ class AuctionScannerApp(tk.Tk):
         main.add(watchlist_frame, weight=1)
 
         results_frame = ttk.Frame(main)
+        style = ttk.Style(self)
+        style.configure("Results.Treeview", rowheight=38)
         columns = ("item", "seller", "price", "age", "sold_at")
         self.results = ttk.Treeview(
-            results_frame, columns=columns, show="headings", selectmode="browse"
+            results_frame,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            style="Results.Treeview",
         )
-        self.results.heading("item", text="Item")
-        self.results.heading("seller", text="Seller")
-        self.results.heading("price", text="Price")
-        self.results.heading("age", text="How Long Ago")
-        self.results.heading("sold_at", text="Timestamp")
+        headings = {
+            "item": "Item",
+            "seller": "Seller",
+            "price": "Price",
+            "age": "How Long Ago",
+            "sold_at": "Timestamp",
+        }
+        for column, title in headings.items():
+            self.results.heading(
+                column,
+                text=title,
+                command=lambda selected_column=column: self.sort_results(selected_column),
+            )
         self.results.column("item", width=230, anchor=W)
         self.results.column("seller", width=140, anchor=W)
         self.results.column("price", width=120, anchor=W)
@@ -399,13 +442,18 @@ class AuctionScannerApp(tk.Tk):
                 seller = str(sale.get("auctioneer") or "")
                 item_name = str(sale.get("item") or resolved.item.name)
                 sold_at = parse_api_datetime(str(sale.get("datetime") or ""))
+                plat_price = numeric_price(sale.get("platPrice"))
+                krono_price = numeric_price(sale.get("kronoPrice"))
                 rows.append(
                     ResultRow(
                         item_name=item_name,
                         seller=seller,
-                        price=format_price(sale.get("platPrice"), sale.get("kronoPrice")),
+                        price=format_price(plat_price, krono_price),
+                        plat_price=plat_price,
+                        krono_price=krono_price,
                         age=format_age(sold_at, now),
                         sold_at=sold_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        sold_at_datetime=sold_at,
                         inquiry=build_inquiry(seller, item_name),
                     )
                 )
@@ -435,15 +483,10 @@ class AuctionScannerApp(tk.Tk):
     def _show_results(
         self, resolved_items: list[ResolvedItem], rows: list[ResultRow]
     ) -> None:
-        self.results.delete(*self.results.get_children())
-        self.row_data.clear()
-        for row in rows:
-            row_id = self.results.insert(
-                "",
-                END,
-                values=(row.item_name, row.seller, row.price, row.age, row.sold_at),
-            )
-            self.row_data[row_id] = row
+        self.result_rows = rows
+        self.sort_column = "sold_at"
+        self.sort_descending = True
+        self._render_results()
 
         unresolved = [item for item in resolved_items if item.item is None]
         partials = [item for item in resolved_items if item.status == "partial"]
@@ -457,6 +500,30 @@ class AuctionScannerApp(tk.Tk):
             if len(unresolved) > 5:
                 status += f", and {len(unresolved) - 5} more"
         self.status_var.set(status)
+
+    def sort_results(self, column: str) -> None:
+        if column == self.sort_column:
+            self.sort_descending = not self.sort_descending
+        else:
+            self.sort_column = column
+            self.sort_descending = column in {"age", "sold_at"}
+        self._render_results()
+
+    def _render_results(self) -> None:
+        self.results.delete(*self.results.get_children())
+        self.row_data.clear()
+        rows = sorted(
+            self.result_rows,
+            key=lambda row: result_sort_key(row, self.sort_column),
+            reverse=self.sort_descending,
+        )
+        for row in rows:
+            row_id = self.results.insert(
+                "",
+                END,
+                values=(row.item_name, row.seller, row.price, row.age, row.sold_at),
+            )
+            self.row_data[row_id] = row
 
     def _finish_busy(self) -> None:
         self.is_busy = False
@@ -490,14 +557,46 @@ def format_age(sold_at: datetime, now: datetime | None = None) -> str:
 
 
 def format_price(plat_price: object, krono_price: object) -> str:
-    plat = float(plat_price or 0)
-    krono = float(krono_price or 0)
+    plat = numeric_price(plat_price)
+    krono = numeric_price(krono_price)
     parts: list[str] = []
     if plat:
         parts.append(f"{plat:g} pp")
     if krono:
         parts.append(f"{krono:g} krono")
     return " + ".join(parts) if parts else "unknown"
+
+
+def numeric_price(value: object) -> float:
+    return float(value or 0)
+
+
+def retry_delay(exc: urllib.error.HTTPError, attempt: int) -> float:
+    retry_after = exc.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after).astimezone(UTC)
+                return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
+            except (TypeError, ValueError):
+                pass
+    return API_BACKOFF_SECONDS * (2**attempt)
+
+
+def result_sort_key(row: ResultRow, column: str) -> object:
+    if column == "item":
+        return row.item_name.casefold()
+    if column == "seller":
+        return row.seller.casefold()
+    if column == "price":
+        return (row.krono_price, row.plat_price)
+    if column == "age":
+        return row.sold_at_datetime
+    if column == "sold_at":
+        return row.sold_at_datetime
+    return row.sold_at_datetime
 
 
 def build_inquiry(seller: str, item_name: str) -> str:
